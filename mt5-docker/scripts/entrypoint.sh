@@ -1,0 +1,219 @@
+#!/bin/bash
+set -e
+
+EA_MOUNT="/mnt/experts"
+# File that stores the MT5 install path in the Wine prefix
+MT5_PATH_FILE="${WINEPREFIX}/.mt5-path"
+
+echo "=== MT5 Headless Container Starting ==="
+echo "Date: $(date)"
+echo "Architecture: $(uname -m) (Hangover Wine — native ARM64 + FEX emulation)"
+echo "Wine: $(wine --version 2>/dev/null || echo 'not found')"
+
+# Start Xvfb (virtual framebuffer) with 24-bit color
+echo "Starting Xvfb on display :99..."
+rm -f /tmp/.X99-lock
+Xvfb :99 -screen 0 1024x768x24 -ac &
+XVFB_PID=$!
+sleep 2
+
+# Verify Xvfb is running
+if ! kill -0 $XVFB_PID 2>/dev/null; then
+    echo "ERROR: Xvfb failed to start"
+    exit 1
+fi
+echo "Xvfb started (PID: $XVFB_PID)"
+
+# Start openbox window manager (required for MT5 GUI rendering)
+openbox --sm-disable &>/dev/null &
+sleep 1
+echo "Window manager started"
+
+# Start VNC server + noVNC for browser-based GUI access
+x11vnc -display :99 -forever -nopw -shared -rfbport 5900 &>/dev/null &
+websockify --web /usr/share/novnc 6080 localhost:5900 &>/dev/null &
+echo "noVNC started — open http://localhost:6080/vnc.html in your browser"
+
+# --- First-run setup: Initialize Wine and install MT5 ---
+
+# Initialize Wine prefix if not done yet
+if [ ! -d "$WINEPREFIX/drive_c" ]; then
+    echo "=== Initializing Wine prefix (first run) ==="
+    timeout 120 wineboot --init 2>/dev/null || true
+    sleep 5
+    wineserver --kill 2>/dev/null || true
+    echo "Wine prefix initialized"
+fi
+
+# Determine MT5 installation path
+MT5_DIR=""
+if [ -f "$MT5_PATH_FILE" ]; then
+    MT5_DIR=$(cat "$MT5_PATH_FILE")
+    if [ ! -f "${MT5_DIR}/terminal64.exe" ]; then
+        echo "WARNING: Saved MT5 path invalid, will search..."
+        MT5_DIR=""
+    fi
+fi
+
+# Search for existing MT5 installation
+if [ -z "$MT5_DIR" ]; then
+    MT5_EXE=$(find ${WINEPREFIX} -name "terminal64.exe" -print -quit 2>/dev/null)
+    if [ -n "$MT5_EXE" ]; then
+        MT5_DIR=$(dirname "$MT5_EXE")
+        echo "$MT5_DIR" > "$MT5_PATH_FILE"
+        echo "Found existing MT5 at: $MT5_DIR"
+    fi
+fi
+
+# Install MT5 if not found
+if [ -z "$MT5_DIR" ]; then
+    echo "=== Installing MetaTrader 5 (first run — this may take a few minutes) ==="
+
+    # Download MT5 installer
+    echo "Downloading MT5 setup..."
+    wget -q "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" \
+        -O /tmp/mt5setup.exe
+    echo "Download complete"
+
+    # Run MT5 installer
+    echo "Running MT5 installer (this downloads and installs MT5 components)..."
+    wine /tmp/mt5setup.exe /auto &
+    SETUP_PID=$!
+
+    # Wait for installer to finish (up to 5 minutes)
+    WAIT=0
+    while kill -0 $SETUP_PID 2>/dev/null && [ $WAIT -lt 300 ]; do
+        sleep 10
+        WAIT=$((WAIT + 10))
+        echo "  Installer running... (${WAIT}s)"
+    done
+
+    # Kill installer if still running
+    if kill -0 $SETUP_PID 2>/dev/null; then
+        echo "  Installer timeout — killing"
+        kill $SETUP_PID 2>/dev/null || true
+    fi
+
+    sleep 5
+    wineserver --kill 2>/dev/null || true
+    rm -f /tmp/mt5setup.exe
+
+    # Find MT5 installation
+    echo "Searching for MT5 installation..."
+    MT5_EXE=$(find ${WINEPREFIX} -name "terminal64.exe" -print -quit 2>/dev/null)
+    if [ -n "$MT5_EXE" ]; then
+        MT5_DIR=$(dirname "$MT5_EXE")
+        echo "$MT5_DIR" > "$MT5_PATH_FILE"
+        echo "MT5 installed at: $MT5_DIR"
+    else
+        echo "WARNING: MT5 installation not found. Will retry on next restart."
+        echo "Check logs for download/install errors."
+    fi
+fi
+
+# --- Normal startup ---
+
+# Check if MT5 is available
+if [ -z "$MT5_DIR" ] || [ ! -f "${MT5_DIR}/terminal64.exe" ]; then
+    echo "ERROR: terminal64.exe not found. MT5 installation may have failed."
+    echo "Container will stay running for debugging. Check logs above."
+    tail -f /dev/null
+fi
+
+echo "MT5 directory: ${MT5_DIR}"
+LOG_DIR="${MT5_DIR}/logs"
+mkdir -p "$LOG_DIR"
+mkdir -p "${MT5_DIR}/MQL5/Experts"
+
+# Sync EA files from mount if they exist
+if [ -d "$EA_MOUNT" ] && [ "$(ls -A $EA_MOUNT 2>/dev/null)" ]; then
+    echo "Syncing EA files from ${EA_MOUNT}..."
+    cp -v ${EA_MOUNT}/*.mq5 "${MT5_DIR}/MQL5/Experts/" 2>/dev/null || true
+    cp -v ${EA_MOUNT}/*.ex5 "${MT5_DIR}/MQL5/Experts/" 2>/dev/null || true
+    echo "EA sync complete"
+fi
+
+# List available EAs
+echo "Available Expert Advisors:"
+ls -la "${MT5_DIR}/MQL5/Experts/" 2>/dev/null || echo "  (none found)"
+
+# Build MT5 command line arguments
+MT5_ARGS="/portable"
+
+# Add broker credentials if provided
+if [ -n "$MT5_LOGIN" ] && [ -n "$MT5_SERVER" ]; then
+    echo "Broker credentials detected..."
+    echo "  Login:  ${MT5_LOGIN}"
+    echo "  Server: ${MT5_SERVER}"
+
+    # Pass credentials directly as command-line args (most reliable)
+    MT5_ARGS="${MT5_ARGS} /login:${MT5_LOGIN} /password:${MT5_PASSWORD} /server:${MT5_SERVER}"
+
+    # Also generate config ini as fallback
+    CONFIG_FILE="${MT5_DIR}/mt5-auto.ini"
+    cat > "$CONFIG_FILE" << EOF
+[Common]
+Login=${MT5_LOGIN}
+Password=${MT5_PASSWORD}
+Server=${MT5_SERVER}
+KeepPrivate=1
+NewsEnable=0
+CertInstall=1
+[Experts]
+AllowLiveTrading=1
+AllowDllImport=0
+Enabled=1
+Account=${MT5_LOGIN}
+Profile=Default
+EOF
+    WIN_CONFIG=$(winepath -w "$CONFIG_FILE" 2>/dev/null || echo "Z:${CONFIG_FILE}")
+    MT5_ARGS="${MT5_ARGS} /config:${WIN_CONFIG}"
+    echo "Config generated: ${CONFIG_FILE}"
+else
+    echo "WARNING: No broker credentials set. MT5 will start without auto-login."
+    echo "  Set MT5_LOGIN, MT5_PASSWORD, MT5_SERVER in .env"
+fi
+
+# Graceful shutdown handler
+cleanup() {
+    echo ""
+    echo "=== Shutting down MT5 ==="
+    wineserver --kill 2>/dev/null || true
+    kill $XVFB_PID 2>/dev/null || true
+    echo "Shutdown complete"
+    exit 0
+}
+trap cleanup SIGTERM SIGINT SIGQUIT
+
+# Start MT5 from its installation directory (must match Wine registry path)
+echo "Starting MetaTrader 5..."
+echo "Command: wine ${MT5_DIR}/terminal64.exe ${MT5_ARGS}"
+cd "${MT5_DIR}"
+wine "${MT5_DIR}/terminal64.exe" ${MT5_ARGS} &
+MT5_PID=$!
+
+# Wait for MT5 to initialize
+sleep 15
+echo "MT5 started (Wine PID: $MT5_PID)"
+
+# Tail logs to stdout so docker logs works
+echo "=== Streaming MT5 logs ==="
+
+# Monitor MT5 process and stream logs
+while kill -0 $MT5_PID 2>/dev/null; do
+    # Find and tail the most recent log file
+    LATEST_LOG=$(ls -t ${LOG_DIR}/*.log 2>/dev/null | head -1)
+    if [ -n "$LATEST_LOG" ]; then
+        tail -f "$LATEST_LOG" &
+        TAIL_PID=$!
+        # Wait for MT5 process or until log file changes
+        wait $MT5_PID 2>/dev/null || true
+        kill $TAIL_PID 2>/dev/null || true
+        break
+    fi
+    sleep 5
+done
+
+# If MT5 exits on its own
+echo "MT5 process exited"
+cleanup
