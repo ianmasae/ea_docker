@@ -65,7 +65,11 @@ This matters because MT5's anti-tampering apparently detects the quality of the 
 │        └─ terminal64.exe (MT5)                  │
 │            ├─ Connected to broker               │
 │            ├─ EAs loaded from /mnt/experts      │
-│            └─ Logs in Wine prefix               │
+│            ├─ Logs in Wine prefix               │
+│            └─ Backtest via /config: INI         │
+│                                                 │
+│  /scripts/backtest.sh  (CLI backtest runner)    │
+│  /scripts/parse_report.py (HTML→JSON/CSV)       │
 │                                                 │
 │  Volumes:                                       │
 │    /root/.wine ← ./data/wine (persisted)        │
@@ -82,12 +86,15 @@ ea/                              # Parent repo with EA source files
 └── mt5-docker/                  # This project
     ├── Dockerfile               # Single-stage, installs Hangover Wine
     ├── docker-compose.yml       # Container orchestration + volumes
+    ├── Makefile                 # CLI commands: make backtest, make help, etc.
     ├── .env                     # Broker credentials (gitignored)
     ├── .env.example             # Template for .env
     ├── .gitignore               # Ignores .env and data/
     ├── scripts/
     │   ├── entrypoint.sh        # Main entrypoint: Xvfb + openbox + Wine init + MT5
-    │   └── healthcheck.sh       # Checks terminal64.exe is running
+    │   ├── healthcheck.sh       # Checks terminal64.exe is running
+    │   ├── backtest.sh          # CLI backtest orchestrator (runs inside container)
+    │   └── parse_report.py      # MT5 HTML report parser → text/JSON/CSV
     ├── data/                    # Created at runtime, persisted via volume
     │   └── wine/                # Wine prefix with MT5 installation
     └── CLAUDE-CONTEXT.md        # This file
@@ -136,8 +143,70 @@ Startup sequence:
 7. Launch MT5: `wine terminal64.exe /portable /login:... /password:... /server:... /config:...`
 8. Stream MT5 logs to stdout for `docker logs` visibility
 9. Trap SIGTERM/SIGINT for graceful Wine shutdown
+10. **Backtest coordination**: If MT5 exits and `/tmp/backtest-running` lock file exists, the entrypoint waits instead of exiting. When the backtest finishes (lock removed), it picks up the new MT5 PID and resumes monitoring. Without this, killing MT5 for a backtest would cause the container to restart.
 
 **Critical**: MT5 must be launched from its Wine prefix installation directory (`cd "${MT5_DIR}"`). It checks the Windows registry for its install path and exits immediately if run from elsewhere.
+
+### scripts/backtest.sh
+
+CLI backtest orchestrator — run via `docker exec mt5-headless /scripts/backtest.sh --ea <name> [options]`, or more conveniently via the Makefile.
+
+**Arguments:**
+- `--ea NAME` (required): EA name without extension
+- `--symbol SYM`: Trading symbol (default: `Volatility 10 (1s) Index`)
+- `--period TF`: Timeframe (default: `H1`)
+- `--from DATE` / `--to DATE`: Date range (default: 3 months ago → today)
+- `--deposit AMT`: Initial deposit (default: `10000`)
+- `--model NUM`: `0`=Every tick, `1`=1min OHLC, `2`=Open price (default: `0`)
+- `--format FMT`: `text`, `json`, `csv` (default: `text`)
+- `--no-restart`: Don't restart MT5 after backtest
+
+**How it works:**
+1. Creates `/tmp/backtest-running` lock file (tells entrypoint not to exit when MT5 dies)
+2. Syncs EA files from `/mnt/experts` to MT5's `MQL5/Experts/`
+3. Kills running MT5 via `wineserver --kill`
+4. Generates `/tmp/backtest-auto.ini` with `[Tester]` section and `ShutdownTerminal=1`
+5. Runs `wine terminal64.exe /portable /config:<ini>` — MT5 exits automatically after test
+6. Finds the generated HTML report (`backtest-report.htm`) in the MT5 directory
+7. Calls `parse_report.py` to extract and format results
+8. Removes lock file and restarts MT5 for live trading
+
+**Key design decisions:**
+- INI file in `/tmp/` to avoid spaces-in-path issues with Wine quoting (`Program Files`)
+- Status messages go to stderr, report output to stdout — enables clean `> results.json` piping
+- Lock file (`/tmp/backtest-running`) coordinates with entrypoint to prevent container restart during backtest
+- `trap cleanup_lock EXIT` ensures lock file is always cleaned up
+- `Expert=FibonacciGoldenZone` (not `Experts\FibonacciGoldenZone`) — MT5 prepends `Experts\` automatically
+
+### scripts/parse_report.py
+
+Parses MT5 Strategy Tester HTML reports (UTF-16LE encoded) into structured data.
+
+**Key format details:**
+- MT5 reports are UTF-16LE with BOM — parser tries UTF-16 → UTF-16-LE → UTF-8 → latin-1
+- Report has 2 HTML tables: Table 1 (Settings + Results), Table 2 (Orders + Deals)
+- Settings rows use `colspan="3"` for label, `colspan="10"` for value — parser skips empty padding cells
+- Numbers use non-breaking space as thousands separator (e.g. `10 000.00`) — stripped before conversion
+- Drawdown values embed both absolute and percentage: `918.60 (29.34%)`
+- Trade counts embed win rate: `33 (60.61%)`
+
+**Output formats:**
+- `text`: Formatted table to stdout with summary metrics and deal list
+- `json`: Full structured JSON (settings, metrics, deals array)
+- `csv`: Metrics as comment headers, deals as CSV rows
+
+### Makefile
+
+Host-side commands that wrap `docker exec mt5-headless /scripts/backtest.sh`:
+
+```bash
+make backtest EA=FibonacciGoldenZone SYMBOL=XAUUSD          # text output
+make backtest-json EA=FibonacciGoldenZone SYMBOL=XAUUSD     # JSON output
+make backtest-csv EA=FibonacciGoldenZone SYMBOL=XAUUSD      # CSV output
+make list-eas                                                 # show available EAs
+make help                                                     # all commands + options
+make build / make up / make down / make restart / make logs   # Docker management
+```
 
 ### scripts/healthcheck.sh
 
@@ -239,6 +308,40 @@ Place `.mq5` or `.ex5` files in the `ea/` parent directory. They sync on contain
 ```bash
 docker compose restart mt5
 ```
+
+### CLI Backtesting
+
+Run backtests from your macOS terminal via the Makefile:
+
+```bash
+# Basic backtest
+make backtest EA=FibonacciGoldenZone SYMBOL=XAUUSD
+
+# Full options
+make backtest EA=FibonacciGoldenZone SYMBOL=XAUUSD PERIOD=H1 FROM=2025.06.01 TO=2026.02.28 MODEL=1
+
+# Export results
+make backtest-json EA=FibonacciGoldenZone SYMBOL=XAUUSD > results.json
+make backtest-csv EA=FibonacciGoldenZone SYMBOL=XAUUSD > results.csv
+
+# List available EAs
+make list-eas
+```
+
+**How backtesting works internally:**
+1. `make backtest` runs `docker exec mt5-headless /scripts/backtest.sh` with the provided args
+2. `backtest.sh` creates a lock file (`/tmp/backtest-running`) so the entrypoint doesn't exit
+3. Kills the running MT5 instance and generates a `[Tester]` INI config
+4. Launches MT5 with `/config:` flag — MT5 runs the test and exits (`ShutdownTerminal=1`)
+5. `parse_report.py` reads the UTF-16LE HTML report and outputs text/JSON/CSV
+6. Removes lock file and restarts MT5 for live trading
+
+**Known behaviors:**
+- Backtesting temporarily pauses live trading (only one MT5 instance per Wine prefix)
+- `MODEL=2` (Open Price) won't work with multi-timeframe EAs like FibonacciGoldenZone
+- FibonacciGoldenZone produces trades on XAUUSD but not on synthetic Volatility indices (the Fibonacci golden zone strategy is designed for real market instruments)
+- MondayGapMetals only trades on instruments with weekend gaps (metals, forex) — not 24/7 synthetic indices
+- Status messages go to stderr, report data to stdout — so `> results.json` captures only the JSON
 
 ## 7. Key Technical Details
 

@@ -39,7 +39,9 @@ RUN mkdir -p /tmp/hangover && cd /tmp/hangover && \
 
 COPY scripts/entrypoint.sh /entrypoint.sh
 COPY scripts/healthcheck.sh /healthcheck.sh
-RUN chmod +x /entrypoint.sh /healthcheck.sh
+COPY scripts/backtest.sh /scripts/backtest.sh
+COPY scripts/parse_report.py /scripts/parse_report.py
+RUN chmod +x /entrypoint.sh /healthcheck.sh /scripts/backtest.sh /scripts/parse_report.py
 
 WORKDIR /opt/mt5
 

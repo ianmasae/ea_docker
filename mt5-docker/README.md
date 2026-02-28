@@ -24,9 +24,9 @@ docker compose logs -f mt5
 
 ## How It Works
 
-- **Ubuntu 22.04 (x86_64)** runs under Docker's x86 emulation on Apple Silicon
-- **Wine** executes the Windows MT5 binary inside Linux
+- **Hangover Wine 11.0** runs natively on ARM64, emulating only Windows app code via FEX
 - **Xvfb** provides a virtual display so MT5 can run headlessly
+- **noVNC** gives browser-based GUI access at `http://localhost:6080/vnc.html`
 - **Portable mode** keeps all data in one directory for clean volume mounts
 
 ## EA Files
@@ -38,6 +38,57 @@ To add or update EAs:
 2. Restart the container: `docker compose restart mt5`
 
 Pre-compiled `.ex5` files in `data/MQL5/Experts/` are also picked up directly.
+
+## Backtesting from the Terminal
+
+Run backtests directly from your macOS terminal using `make`:
+
+```bash
+# Run a backtest (results printed to terminal)
+make backtest EA=FibonacciGoldenZone SYMBOL=XAUUSD
+
+# With full options
+make backtest EA=FibonacciGoldenZone SYMBOL=XAUUSD PERIOD=H1 FROM=2025.06.01 TO=2026.02.28
+
+# Export to JSON or CSV
+make backtest-json EA=FibonacciGoldenZone SYMBOL=XAUUSD > results.json
+make backtest-csv EA=FibonacciGoldenZone SYMBOL=XAUUSD > results.csv
+
+# List available EAs
+make list-eas
+
+# Show all commands and options
+make help
+```
+
+### Backtest Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `EA` | *(required)* | EA name without extension (e.g. `FibonacciGoldenZone`) |
+| `SYMBOL` | `Volatility 10 (1s) Index` | Trading symbol |
+| `PERIOD` | `H1` | Timeframe: `M1`, `M5`, `M15`, `M30`, `H1`, `H4`, `D1`, `W1`, `MN` |
+| `FROM` | 3 months ago | Start date (`YYYY.MM.DD`) |
+| `TO` | today | End date (`YYYY.MM.DD`) |
+| `DEPOSIT` | `10000` | Initial deposit |
+| `MODEL` | `0` | Tick model: `0`=Every tick, `1`=1min OHLC, `2`=Open price only |
+
+### How It Works
+
+The backtest script (`scripts/backtest.sh`):
+1. Syncs the latest EA files from the host
+2. Stops the running MT5 instance
+3. Generates a backtest config (INI file)
+4. Runs MT5 with `ShutdownTerminal=1` (exits after test)
+5. Parses the HTML report into text/JSON/CSV
+6. Restarts MT5 for live trading
+
+**Note**: Backtesting temporarily pauses live trading. MT5 is automatically restarted after the test completes.
+
+### Tips
+- Use `MODEL=1` (1-min OHLC) for a good balance of speed and accuracy
+- `MODEL=2` (Open price) won't work with EAs that use multi-timeframe analysis
+- Match the symbol to your EA's design — e.g. `FibonacciGoldenZone` works well on `XAUUSD`, not on synthetic Volatility indices
 
 ## Broker Login
 
@@ -61,12 +112,18 @@ If MT5 fails to connect (check `docker compose logs mt5`), verify:
 ```bash
 # View live logs
 docker compose logs -f mt5
+# or
+make logs
 
-# Stop
+# Stop / Start / Restart
 docker compose down
+docker compose up -d
+make restart
 
 # Rebuild after Dockerfile changes
 docker compose build --no-cache
+# or
+make build
 
 # Shell into running container
 docker compose exec mt5 bash
@@ -81,15 +138,16 @@ docker compose exec mt5 pgrep -a terminal64
 mt5-docker/
 ├── Dockerfile
 ├── docker-compose.yml
+├── Makefile                # Easy CLI commands (make backtest, make help)
 ├── .env                    # Your broker credentials (git-ignored)
 ├── .env.example
 ├── scripts/
 │   ├── entrypoint.sh       # Container entrypoint
-│   └── healthcheck.sh
+│   ├── healthcheck.sh
+│   ├── backtest.sh         # Backtest orchestrator (runs inside container)
+│   └── parse_report.py     # MT5 HTML report parser → text/JSON/CSV
 ├── data/                   # Persisted MT5 data (git-ignored)
-│   ├── MQL5/Experts/       # Compiled EAs
-│   ├── MQL5/Logs/          # Trading logs
-│   └── config/             # Broker/server configs
+│   └── wine/               # Wine prefix with MT5 installation
 ```
 
 ## Troubleshooting

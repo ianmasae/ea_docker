@@ -200,16 +200,45 @@ echo "MT5 started (Wine PID: $MT5_PID)"
 echo "=== Streaming MT5 logs ==="
 
 # Monitor MT5 process and stream logs
-while kill -0 $MT5_PID 2>/dev/null; do
-    # Find and tail the most recent log file
-    LATEST_LOG=$(ls -t ${LOG_DIR}/*.log 2>/dev/null | head -1)
-    if [ -n "$LATEST_LOG" ]; then
-        tail -f "$LATEST_LOG" &
-        TAIL_PID=$!
-        # Wait for MT5 process or until log file changes
-        wait $MT5_PID 2>/dev/null || true
-        kill $TAIL_PID 2>/dev/null || true
-        break
+TAIL_PID=""
+while true; do
+    # Check if MT5 Wine process is alive
+    if ! kill -0 $MT5_PID 2>/dev/null; then
+        # MT5 died — check if a backtest is running
+        if [ -f /tmp/backtest-running ]; then
+            echo "MT5 stopped for backtest — waiting for backtest to complete..."
+            kill $TAIL_PID 2>/dev/null || true
+            TAIL_PID=""
+            # Wait for backtest to finish (lock file removed)
+            while [ -f /tmp/backtest-running ]; do
+                sleep 5
+            done
+            echo "Backtest complete — monitoring resumed"
+            # Find new MT5 PID (backtest.sh restarts it)
+            sleep 5
+            NEW_PID=$(pgrep -f "terminal64.exe" | head -1)
+            if [ -n "$NEW_PID" ]; then
+                MT5_PID=$NEW_PID
+                echo "MT5 restarted (PID: $MT5_PID)"
+                continue
+            else
+                echo "WARNING: MT5 not restarted after backtest"
+                break
+            fi
+        else
+            # Normal exit — not a backtest
+            kill $TAIL_PID 2>/dev/null || true
+            break
+        fi
+    fi
+
+    # Tail the most recent log file
+    if [ -z "$TAIL_PID" ] || ! kill -0 $TAIL_PID 2>/dev/null; then
+        LATEST_LOG=$(ls -t ${LOG_DIR}/*.log 2>/dev/null | head -1)
+        if [ -n "$LATEST_LOG" ]; then
+            tail -f "$LATEST_LOG" &
+            TAIL_PID=$!
+        fi
     fi
     sleep 5
 done
