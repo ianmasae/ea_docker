@@ -34,6 +34,23 @@ x11vnc -display :99 -forever -nopw -shared -rfbport 5900 &>/dev/null &
 websockify --web /usr/share/novnc 6080 localhost:5900 &>/dev/null &
 echo "noVNC started — open http://localhost:6080/vnc.html in your browser"
 
+# --- Start API server early (so Railway healthcheck passes during MT5 install) ---
+API_PID=""
+if [ "${API_ENABLED:-true}" = "true" ]; then
+    API_PORT="${API_PORT:-${PORT:-8000}}"
+    BRIDGE_PORT="${BRIDGE_PORT:-15555}"
+    echo "Starting Trading API server on port ${API_PORT} (bridge: ${BRIDGE_PORT})..."
+    PYTHONPATH=/ python3 -m uvicorn server.api:app --host 0.0.0.0 --port "${API_PORT}" --log-level info &
+    API_PID=$!
+    sleep 2
+    if kill -0 $API_PID 2>/dev/null; then
+        echo "API server started (PID: $API_PID)"
+    else
+        echo "WARNING: API server failed to start"
+        API_PID=""
+    fi
+fi
+
 # --- First-run setup: Initialize Wine and install MT5 ---
 
 # Initialize Wine prefix if not done yet
@@ -209,23 +226,6 @@ EOF
 else
     echo "WARNING: No broker credentials set. MT5 will start without auto-login."
     echo "  Set MT5_LOGIN, MT5_PASSWORD, MT5_SERVER in .env"
-fi
-
-# --- Start API server (if enabled) ---
-API_PID=""
-if [ "${API_ENABLED:-true}" = "true" ]; then
-    API_PORT="${API_PORT:-${PORT:-8000}}"
-    BRIDGE_PORT="${BRIDGE_PORT:-15555}"
-    echo "Starting Trading API server on port ${API_PORT} (bridge: ${BRIDGE_PORT})..."
-    PYTHONPATH=/ python3 -m uvicorn server.api:app --host 0.0.0.0 --port "${API_PORT}" --log-level info &
-    API_PID=$!
-    sleep 2
-    if kill -0 $API_PID 2>/dev/null; then
-        echo "API server started (PID: $API_PID)"
-    else
-        echo "WARNING: API server failed to start"
-        API_PID=""
-    fi
 fi
 
 # Graceful shutdown handler
