@@ -52,29 +52,41 @@ This matters because MT5's anti-tampering apparently detects the quality of the 
 ## 3. Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Docker Container (ARM64 native, Ubuntu 22.04)  │
-│                                                 │
-│  Xvfb :99 (virtual framebuffer, 1024x768x24)   │
-│  Openbox (window manager — required for MT5)    │
-│  x11vnc → websockify → noVNC (port 6080)       │
-│    └─ Browser GUI: http://localhost:6080/vnc.html│
-│                                                 │
-│  Hangover Wine 11.0 (ARM64 native)              │
-│    └─ FEX emulator (x86_64 → ARM64)            │
-│        └─ terminal64.exe (MT5)                  │
-│            ├─ Connected to broker               │
-│            ├─ EAs loaded from /mnt/experts      │
-│            ├─ Logs in Wine prefix               │
-│            └─ Backtest via /config: INI         │
-│                                                 │
-│  /scripts/backtest.sh  (CLI backtest runner)    │
-│  /scripts/parse_report.py (HTML→JSON/CSV)       │
-│                                                 │
-│  Volumes:                                       │
-│    /root/.wine ← ./data/wine (persisted)        │
-│    /mnt/experts ← ../  (EA source, read-only)   │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  Docker Container (ARM64 native, Ubuntu 22.04)           │
+│                                                          │
+│  Xvfb :99 (virtual framebuffer, 1024x768x24)            │
+│  Openbox (window manager — required for MT5)             │
+│  x11vnc → websockify → noVNC (port 6080)                │
+│    └─ Browser GUI: http://localhost:6080/vnc.html        │
+│                                                          │
+│  Hangover Wine 11.0 (ARM64 native)                       │
+│    └─ FEX emulator (x86_64 → ARM64)                     │
+│        └─ terminal64.exe (MT5)                           │
+│            ├─ Connected to broker                        │
+│            ├─ EAs loaded from /mnt/experts               │
+│            ├─ BridgeService.ex5 (MQL5 Service)           │
+│            │     └─ SocketConnect → TCP 127.0.0.1:15555  │
+│            ├─ Logs in Wine prefix                        │
+│            └─ Backtest via /config: INI                  │
+│                                                          │
+│  FastAPI Trading API Server (port 8000)                  │
+│    ├─ REST endpoints: /account, /positions, /trade/*, ...│
+│    ├─ TCP bridge server (port 15555)                     │
+│    │     └─ BridgeService connects here via SocketConnect│
+│    ├─ Protocol: 4-byte length prefix + JSON              │
+│    └─ Swagger docs: http://localhost:8000/docs           │
+│                                                          │
+│  /scripts/backtest.sh  (CLI backtest runner)             │
+│  /scripts/parse_report.py (HTML→JSON/CSV)                │
+│                                                          │
+│  Volumes:                                                │
+│    /root/.wine ← ./data/wine (persisted)                 │
+│    /mnt/experts ← ../  (EA source, read-only)            │
+└──────────────────────────────────────────────────────────┘
+
+Trading API data flow:
+  Bot/Client ──HTTP──> FastAPI (:8000) ──TCP──> BridgeService (MQL5) ──> MT5 ──> Broker
 ```
 
 ## 4. Directory Structure
@@ -84,17 +96,28 @@ ea/                              # Parent repo with EA source files
 ├── FibonacciGoldenZone.mq5      # EA source file
 ├── MondayGapMetals.mq5          # EA source file
 └── mt5-docker/                  # This project
-    ├── Dockerfile               # Single-stage, installs Hangover Wine
-    ├── docker-compose.yml       # Container orchestration + volumes
-    ├── Makefile                 # CLI commands: make backtest, make help, etc.
+    ├── Dockerfile               # Single-stage, installs Hangover Wine + Python deps
+    ├── docker-compose.yml       # Container orchestration + volumes + API port
+    ├── Makefile                 # CLI commands: backtest, api-health, setup-bridge, etc.
     ├── .env                     # Broker credentials (gitignored)
-    ├── .env.example             # Template for .env
+    ├── .env.example             # Template for .env (includes API settings)
     ├── .gitignore               # Ignores .env and data/
+    ├── ea/
+    │   ├── BridgeEA.mq5         # Bridge Expert Advisor (backup, not actively used)
+    │   └── BridgeService.mq5    # Bridge MQL5 Service — TCP socket bridge to Python API
+    ├── server/
+    │   ├── __init__.py          # Package marker
+    │   ├── api.py               # FastAPI REST endpoints (14 endpoints)
+    │   ├── bridge.py            # Async TCP server — manages EA/Service connection
+    │   ├── models.py            # Pydantic request/response models
+    │   └── requirements.txt     # fastapi, uvicorn, pydantic
     ├── scripts/
-    │   ├── entrypoint.sh        # Main entrypoint: Xvfb + openbox + Wine init + MT5
+    │   ├── entrypoint.sh        # Main entrypoint: Xvfb + openbox + Wine + MT5 + API server
     │   ├── healthcheck.sh       # Checks terminal64.exe is running
     │   ├── backtest.sh          # CLI backtest orchestrator (runs inside container)
-    │   └── parse_report.py      # MT5 HTML report parser → text/JSON/CSV
+    │   ├── parse_report.py      # MT5 HTML report parser → text/JSON/CSV
+    │   ├── start_bridge_service.sh  # One-time GUI automation for socket whitelist
+    │   └── setup_bridge_chart.py    # Chart profile helper (unused, kept for reference)
     ├── data/                    # Created at runtime, persisted via volume
     │   └── wine/                # Wine prefix with MT5 installation
     └── CLAUDE-CONTEXT.md        # This file
@@ -104,13 +127,15 @@ ea/                              # Parent repo with EA source files
 
 ### Dockerfile
 
-Single-stage build on `ubuntu:22.04` (ARM64 native). Three main steps:
+Single-stage build on `ubuntu:22.04` (ARM64 native). Four main steps:
 
 1. **HTTPS bootstrap**: Install `ca-certificates` over HTTP, then switch apt sources to HTTPS. Required because the user's ISP (Safaricom Kenya) intercepts/corrupts plain HTTP traffic.
 
 2. **Runtime deps**: `xvfb` (virtual display), `openbox` (window manager — MT5 won't render without one), `xdotool` (for dismissing dialogs programmatically), `wget`, `procps`, `x11vnc` + `novnc` + `python3-websockify` (browser-based GUI access via noVNC).
 
 3. **Hangover Wine**: Downloaded as a `.tar` from GitHub releases containing `.deb` packages. Installed via `apt install ./hangover*.deb` which resolves all dependencies automatically. Hangover provides `/usr/bin/wine` and `/usr/bin/wineserver`.
+
+4. **Python API server**: `pip3 install` of `fastapi`, `uvicorn`, `pydantic` from `server/requirements.txt`. Server code and MQL5 bridge files are copied into the image.
 
 **Why NOT build-time MT5 install**: MT5's installer (`mt5setup.exe`) is a stub downloader that requires network + GUI. It's unreliable during Docker builds (timeouts, no progress visibility). Runtime installation via the entrypoint is more robust and the result is persisted via the Wine prefix volume.
 
@@ -124,7 +149,9 @@ Key settings:
 - **`memory: 4G`** — MT5 + Wine + FEX emulation use ~500MB normally, can spike during compilation
 - **`start_period: 120s`** — healthcheck grace period for first-run installation
 - **Port `6080:6080`** — noVNC browser-based GUI access at `http://localhost:6080/vnc.html`
+- **Port `8000:8000`** — Trading API server (FastAPI + Swagger docs)
 - **Port `5900:5900`** (commented out) — direct VNC client access
+- **Environment**: `API_ENABLED=true`, `API_PORT=8000`, `BRIDGE_PORT=15555`
 
 ### scripts/entrypoint.sh
 
@@ -133,17 +160,20 @@ Startup sequence:
 2. Start openbox window manager (MT5 requires a WM for window mapping)
 3. Start x11vnc + websockify (noVNC) for browser-based GUI access on port 6080
 4. Initialize Wine prefix if first run (`wineboot --init`)
-4. Find existing MT5 installation in Wine prefix, or install it:
+5. Find existing MT5 installation in Wine prefix, or install it:
    - Download `mt5setup.exe` from MetaQuotes CDN
    - Run `wine mt5setup.exe /auto` (silent install)
    - Wait up to 5 minutes, then find `terminal64.exe`
    - Save the install path to `$WINEPREFIX/.mt5-path`
-5. Sync `.mq5` and `.ex5` files from `/mnt/experts` to MT5's `MQL5/Experts/`
-6. Generate `mt5-auto.ini` config with broker credentials
-7. Launch MT5: `wine terminal64.exe /portable /login:... /password:... /server:... /config:...`
-8. Stream MT5 logs to stdout for `docker logs` visibility
-9. Trap SIGTERM/SIGINT for graceful Wine shutdown
-10. **Backtest coordination**: If MT5 exits and `/tmp/backtest-running` lock file exists, the entrypoint waits instead of exiting. When the backtest finishes (lock removed), it picks up the new MT5 PID and resumes monitoring. Without this, killing MT5 for a backtest would cause the container to restart.
+6. Sync `.mq5` and `.ex5` files from `/mnt/experts` to MT5's `MQL5/Experts/`
+7. Copy BridgeEA.mq5 to `MQL5/Experts/` and BridgeService.mq5 to `MQL5/Services/`
+8. Compile BridgeService.mq5 to .ex5 via MetaEditor CLI (if not already compiled)
+9. Generate `mt5-auto.ini` config with broker credentials
+10. Start FastAPI trading API server (`uvicorn server.api:app` on port 8000) — TCP bridge starts listening on port 15555
+11. Launch MT5: `wine terminal64.exe /portable /login:... /password:... /server:... /config:...`
+12. Stream MT5 logs to stdout for `docker logs` visibility
+13. Trap SIGTERM/SIGINT for graceful shutdown (kills Wine, API server)
+14. **Lock file coordination**: If MT5 exits and `/tmp/backtest-running` or `/tmp/account-switch-running` lock file exists, the entrypoint waits instead of exiting. When the operation finishes, it picks up the new MT5 PID and resumes monitoring.
 
 **Critical**: MT5 must be launched from its Wine prefix installation directory (`cd "${MT5_DIR}"`). It checks the Windows registry for its install path and exits immediately if run from elsewhere.
 
@@ -195,6 +225,71 @@ Parses MT5 Strategy Tester HTML reports (UTF-16LE encoded) into structured data.
 - `json`: Full structured JSON (settings, metrics, deals array)
 - `csv`: Metrics as comment headers, deals as CSV rows
 
+### server/bridge.py — Async TCP Bridge Server
+
+The `MT5Bridge` class manages the TCP connection between the Python API and the BridgeService running inside MT5.
+
+**Key design:**
+- Asyncio TCP server on port 15555 (configurable via `BRIDGE_PORT`)
+- Single-connection model — only one BridgeService connects at a time
+- Length-prefixed framing: 4-byte big-endian uint32 header + JSON payload
+- Request/response matching by UUID — each command gets a unique ID, response carries the same ID
+- Pending requests tracked via `Dict[str, asyncio.Future]` with configurable timeout (default 10s)
+- Auto-handles disconnection/reconnection — pending futures are cancelled on disconnect
+
+**Protocol:**
+```
+[4 bytes: payload length (big-endian)] [JSON payload]
+```
+
+Example command: `{"id":"uuid","command":"account_info","params":{}}`
+Example response: `{"id":"uuid","command":"account_info","data":{...}}`
+
+### server/api.py — FastAPI Application
+
+14 REST endpoints with lifespan context manager for bridge start/stop. Key details:
+- `_cmd()` helper wraps bridge commands with HTTP error handling (503 if disconnected, 504 if timeout)
+- Account switching kills wineserver, restarts MT5 with new credentials (uses `/tmp/account-switch-running` lock)
+- Backtesting delegates to existing `backtest.sh` script via subprocess
+- `PYTHONPATH=/` required when running via uvicorn from entrypoint (server/ is at /server/)
+
+### server/models.py — Pydantic Models
+
+Request models: `TradeRequest`, `CloseRequest`, `ModifyRequest`, `LoginRequest`, `HistoryRequest`, `BacktestRequest`
+Response models: `AccountInfo`, `Position`, `Order`, `Deal`, `SymbolInfo`, `Tick`, `TradeResult`, `HealthStatus`
+
+### ea/BridgeService.mq5 — MQL5 Service
+
+An MQL5 Service (`#property service`) that runs independently without chart attachment. Connects to the Python TCP server via `SocketConnect("127.0.0.1", 15555)`.
+
+**Key features:**
+- Uses `OnStart()` with `while(!IsStopped()) { Sleep(100); }` main loop
+- Same length-prefixed JSON protocol as the Python side
+- Manual JSON parsing (MQL5 has no JSON library) — `JsonGetString()`, `JsonGetDouble()`, etc.
+- `EscapeJson()` for safe JSON string building
+- `CTrade` class for trade execution
+- Auto-reconnects every 5 seconds if connection drops
+- Handles commands: `ping`, `account_info`, `positions`, `orders`, `history`, `market_buy`, `market_sell`, `close_position`, `modify_position`, `symbol_info`, `symbols_list`, `tick`
+
+**Once started (via Navigator → Services → right-click → Start), the service auto-starts on all subsequent MT5 restarts.** No chart or EA attachment needed.
+
+### ea/BridgeEA.mq5 — Bridge Expert Advisor (backup)
+
+Original EA version using `OnTimer()` at 100ms. Same protocol and command handlers as BridgeService but requires chart attachment. Kept as a backup — the Service version is preferred.
+
+### scripts/start_bridge_service.sh — One-Time Setup Script
+
+Uses xdotool GUI automation to:
+1. Open MT5 Options dialog (Ctrl+O)
+2. Navigate to Expert Advisors tab
+3. Enable "Allow WebRequest for listed URL"
+4. Add `127.0.0.1` to the allowed list
+5. Click OK
+
+Falls back to clear manual instructions if automation fails. Run via `make setup-bridge`.
+
+**CRITICAL**: The socket whitelist (allowed addresses for `SocketConnect`) is stored **encrypted** in MT5's `settings.ini`. It **cannot** be set via plain-text config files like `common.ini`. The `AllowedAddresses` field in `common.ini` has no effect on socket permissions. The GUI is the only way.
+
 ### Makefile
 
 Host-side commands that wrap `docker exec mt5-headless /scripts/backtest.sh`:
@@ -206,6 +301,8 @@ make backtest-csv EA=FibonacciGoldenZone SYMBOL=XAUUSD      # CSV output
 make list-eas                                                 # show available EAs
 make help                                                     # all commands + options
 make build / make up / make down / make restart / make logs   # Docker management
+make setup-bridge                                             # one-time API setup
+make api-health / make api-account / make api-positions / make api-symbols  # API queries
 ```
 
 ### scripts/healthcheck.sh
@@ -442,6 +539,29 @@ docker compose up -d
 # IMPORTANT: Redo broker discovery via the GUI after reset
 ```
 
+### Trading API: ea_connected is false
+The BridgeService is running but can't connect to the Python TCP server.
+
+**Most likely cause**: `127.0.0.1` is not in the WebRequest whitelist. The socket whitelist is stored **encrypted** in `settings.ini` and CANNOT be set via text config files.
+
+**Fix**: Run `make setup-bridge` or manually add `127.0.0.1` via the GUI:
+1. Open `http://localhost:6080/vnc.html`
+2. Tools → Options → Expert Advisors tab
+3. Check "Allow WebRequest for listed URL"
+4. Double-click the URL area, type `127.0.0.1`
+5. Click OK
+
+**Other causes**:
+- BridgeService not started: Check Navigator → Services → right-click BridgeService → Start
+- BridgeService not compiled: Check `MQL5/Services/BridgeService.ex5` exists. If not, the entrypoint compiles it on startup.
+- API server not running: Check `curl http://localhost:8000/health` — if unreachable, check container logs for uvicorn errors
+
+### Trading API: "EA not connected" on some requests
+Intermittent 503 errors. The BridgeService briefly disconnects during command processing. This is normal on first connection or after MT5 restarts. Retry the request.
+
+### common.ini AllowedAddresses does NOT work
+The `AllowedAddresses` field in `common.ini` (even properly UTF-16LE encoded) has NO effect on `SocketConnect()` permissions. MetaQuotes stores the socket whitelist encrypted in `settings.ini`. This was confirmed through extensive testing. The GUI is the only way to set it.
+
 ### LiveUpdate dialog blocks MT5
 MT5 may show a "Welcome to LiveUpdate" dialog on startup. The entrypoint doesn't currently dismiss this automatically. Options:
 - Use xdotool to dismiss: `docker exec mt5-headless xdotool search --name 'LiveUpdate' key Tab Return`
@@ -480,3 +600,9 @@ This section documents every approach attempted so you don't repeat failed exper
 5. **Hangover Wine 11.0** — Works. MT5 installs, renders GUI, connects to broker, compiles files, CPU ~8%. This is the current solution.
 
 6. **MT5 connected to broker but no market data** — After container restart, MT5 showed the correct account/server in the title bar but had zero outbound TCP connections, empty Market Watch, and "Waiting for update". Root cause: the generic MT5 build from MetaQuotes CDN doesn't include broker-specific server IP addresses. The `/server:Deriv-Demo` flag tells MT5 the name but not the address. Fix: perform a one-time broker discovery via **File → Open an Account → search broker name → "Find your company"**. This queries the MetaQuotes central directory and caches server addresses in the Wine prefix. Once done, connections persist across restarts.
+
+7. **Trading API: BridgeEA chart profile injection** — Tried to auto-attach BridgeEA to charts by injecting `<expert>` sections into `.chr` profile files (UTF-16LE encoded). MT5 stores runtime chart/EA state in binary `.dat` files and ignores modified text `.chr` profiles on subsequent startups. Also tried deleting `experts.dat` to force reload — didn't work. **Abandoned in favor of BridgeService (MQL5 Service)** which requires no chart attachment.
+
+8. **Trading API: common.ini AllowedAddresses** — Wrote `[Experts]\r\nAllowedAddresses=127.0.0.1\r\n` to `common.ini` in proper UTF-16LE encoding with BOM. BridgeService still got error 4014 (ERR_FUNCTION_NOT_ALLOWED) on `SocketConnect()`. After extensive testing, confirmed that MetaQuotes stores the socket whitelist **encrypted** in `settings.ini`, not in `common.ini`. The `AllowedAddresses` field has no effect. **Fix: set via GUI** (Tools → Options → Expert Advisors → "Allow WebRequest for listed URL" → add `127.0.0.1`). Automated via xdotool in `scripts/start_bridge_service.sh`.
+
+9. **Trading API: BridgeService working** — After whitelisting `127.0.0.1` via the GUI, BridgeService connected to the Python TCP server immediately. All 14 API endpoints verified working. Successfully executed buy/modify/close trades on Deriv Volatility indices (24/7 market) via the REST API.

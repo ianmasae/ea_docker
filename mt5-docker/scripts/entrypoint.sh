@@ -133,6 +133,43 @@ if [ -d "$EA_MOUNT" ] && [ "$(ls -A $EA_MOUNT 2>/dev/null)" ]; then
     echo "EA sync complete"
 fi
 
+# Copy BridgeEA for the trading API
+if [ -f "/opt/mt5/BridgeEA.mq5" ]; then
+    cp -v /opt/mt5/BridgeEA.mq5 "${MT5_DIR}/MQL5/Experts/" 2>/dev/null || true
+    echo "BridgeEA copied to Experts directory"
+fi
+
+# Copy BridgeService to Services directory
+mkdir -p "${MT5_DIR}/MQL5/Services"
+if [ -f "/opt/mt5/BridgeService.mq5" ]; then
+    cp -v /opt/mt5/BridgeService.mq5 "${MT5_DIR}/MQL5/Services/" 2>/dev/null || true
+    echo "BridgeService copied to Services directory"
+fi
+
+# NOTE: Socket whitelist (127.0.0.1) for MQL5 SocketConnect is stored
+# encrypted in settings.ini — it CANNOT be set via text config files.
+# It must be set once via GUI: Tools → Options → Expert Advisors →
+# check "Allow WebRequest for listed URL" → add 127.0.0.1 → OK.
+# Run: make setup-bridge (or /scripts/start_bridge_service.sh) to automate this.
+# Once set, the whitelist persists across MT5 restarts.
+
+# Compile BridgeService if .ex5 doesn't exist yet
+if [ "${API_ENABLED:-true}" = "true" ]; then
+    SERVICE_EX5="${MT5_DIR}/MQL5/Services/BridgeService.ex5"
+    if [ ! -f "$SERVICE_EX5" ] && [ -f "${MT5_DIR}/MetaEditor64.exe" ]; then
+        echo "Compiling BridgeService..."
+        cd "${MT5_DIR}"
+        timeout 60 wine "${MT5_DIR}/MetaEditor64.exe" /compile:"MQL5/Services/BridgeService.mq5" /log 2>/dev/null || true
+        wineserver --kill 2>/dev/null || true
+        sleep 2
+        if [ -f "$SERVICE_EX5" ]; then
+            echo "BridgeService compiled successfully"
+        else
+            echo "WARNING: BridgeService compilation may have failed — MT5 will auto-compile on start"
+        fi
+    fi
+fi
+
 # List available EAs
 echo "Available Expert Advisors:"
 ls -la "${MT5_DIR}/MQL5/Experts/" 2>/dev/null || echo "  (none found)"
@@ -174,12 +211,33 @@ else
     echo "  Set MT5_LOGIN, MT5_PASSWORD, MT5_SERVER in .env"
 fi
 
+# --- Start API server (if enabled) ---
+API_PID=""
+if [ "${API_ENABLED:-true}" = "true" ]; then
+    API_PORT="${API_PORT:-8000}"
+    BRIDGE_PORT="${BRIDGE_PORT:-15555}"
+    echo "Starting Trading API server on port ${API_PORT} (bridge: ${BRIDGE_PORT})..."
+    PYTHONPATH=/ python3 -m uvicorn server.api:app --host 0.0.0.0 --port "${API_PORT}" --log-level info &
+    API_PID=$!
+    sleep 2
+    if kill -0 $API_PID 2>/dev/null; then
+        echo "API server started (PID: $API_PID)"
+    else
+        echo "WARNING: API server failed to start"
+        API_PID=""
+    fi
+fi
+
 # Graceful shutdown handler
 cleanup() {
     echo ""
     echo "=== Shutting down MT5 ==="
     wineserver --kill 2>/dev/null || true
     kill $XVFB_PID 2>/dev/null || true
+    if [ -n "$API_PID" ]; then
+        kill $API_PID 2>/dev/null || true
+        echo "API server stopped"
+    fi
     echo "Shutdown complete"
     exit 0
 }
@@ -204,16 +262,16 @@ TAIL_PID=""
 while true; do
     # Check if MT5 Wine process is alive
     if ! kill -0 $MT5_PID 2>/dev/null; then
-        # MT5 died — check if a backtest is running
-        if [ -f /tmp/backtest-running ]; then
-            echo "MT5 stopped for backtest — waiting for backtest to complete..."
+        # MT5 died — check if a backtest or account switch is running
+        if [ -f /tmp/backtest-running ] || [ -f /tmp/account-switch-running ]; then
+            echo "MT5 stopped for backtest/account switch — waiting..."
             kill $TAIL_PID 2>/dev/null || true
             TAIL_PID=""
-            # Wait for backtest to finish (lock file removed)
-            while [ -f /tmp/backtest-running ]; do
+            # Wait for operation to finish (lock files removed)
+            while [ -f /tmp/backtest-running ] || [ -f /tmp/account-switch-running ]; do
                 sleep 5
             done
-            echo "Backtest complete — monitoring resumed"
+            echo "Operation complete — monitoring resumed"
             # Find new MT5 PID (backtest.sh restarts it)
             sleep 5
             NEW_PID=$(pgrep -f "terminal64.exe" | head -1)

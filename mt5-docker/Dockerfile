@@ -23,7 +23,7 @@ RUN apt-get update && \
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     xvfb wget xauth procps openbox xdotool \
-    x11vnc novnc python3 python3-websockify \
+    x11vnc novnc python3 python3-pip python3-websockify \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Hangover Wine (ARM64-native Wine with FEX x86_64 emulation)
@@ -37,11 +37,22 @@ RUN mkdir -p /tmp/hangover && cd /tmp/hangover && \
     rm -rf /tmp/hangover /var/lib/apt/lists/* && \
     echo "Hangover Wine installed: $(wine --version)"
 
+# Install Python API server dependencies
+COPY server/requirements.txt /server/requirements.txt
+RUN pip3 install --no-cache-dir -r /server/requirements.txt
+
 COPY scripts/entrypoint.sh /entrypoint.sh
 COPY scripts/healthcheck.sh /healthcheck.sh
 COPY scripts/backtest.sh /scripts/backtest.sh
 COPY scripts/parse_report.py /scripts/parse_report.py
-RUN chmod +x /entrypoint.sh /healthcheck.sh /scripts/backtest.sh /scripts/parse_report.py
+COPY scripts/setup_bridge_chart.py /scripts/setup_bridge_chart.py
+COPY scripts/start_bridge_service.sh /scripts/start_bridge_service.sh
+COPY server/ /server/
+COPY ea/BridgeEA.mq5 /opt/mt5/BridgeEA.mq5
+COPY ea/BridgeService.mq5 /opt/mt5/BridgeService.mq5
+RUN chmod +x /entrypoint.sh /healthcheck.sh /scripts/backtest.sh /scripts/parse_report.py /scripts/start_bridge_service.sh
+
+EXPOSE 8000
 
 WORKDIR /opt/mt5
 

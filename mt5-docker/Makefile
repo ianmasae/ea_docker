@@ -31,7 +31,10 @@ ifdef TO
   BACKTEST_ARGS += --to "$(TO)"
 endif
 
-.PHONY: help backtest backtest-json backtest-csv list-eas build up down restart logs
+API_PORT ?= 8000
+API_URL := http://localhost:$(API_PORT)
+
+.PHONY: help backtest backtest-json backtest-csv list-eas build up down restart logs setup-bridge api-health api-account api-positions api-symbols
 
 help: ## Show this help
 	@echo ""
@@ -52,6 +55,13 @@ help: ## Show this help
 	@echo "  TO=2026.02.28                        End date"
 	@echo "  DEPOSIT=10000                        Initial deposit"
 	@echo "  MODEL=0                              0=Every tick, 1=1min OHLC, 2=Open price"
+	@echo ""
+	@echo "Trading API (first-time setup: make setup-bridge):"
+	@echo "  make setup-bridge                    Start BridgeService (one-time)"
+	@echo "  make api-health                      Check API + EA connection status"
+	@echo "  make api-account                     Show account info"
+	@echo "  make api-positions                   List open positions"
+	@echo "  make api-symbols                     List available symbols"
 	@echo ""
 	@echo "Docker:"
 	@echo "  make build                           Build the Docker image"
@@ -96,6 +106,21 @@ restart: ## Restart the container
 
 logs: ## Tail container logs
 	docker compose logs -f mt5
+
+setup-bridge: ## Start the BridgeService (one-time setup)
+	@docker exec $(CONTAINER) /scripts/start_bridge_service.sh 30
+
+api-health: ## Check API + EA connection status
+	@curl -s $(API_URL)/health | python3 -m json.tool 2>/dev/null || echo "API not reachable at $(API_URL)"
+
+api-account: ## Show account info
+	@curl -s $(API_URL)/account | python3 -m json.tool 2>/dev/null || echo "API not reachable at $(API_URL)"
+
+api-positions: ## List open positions
+	@curl -s $(API_URL)/positions | python3 -m json.tool 2>/dev/null || echo "API not reachable at $(API_URL)"
+
+api-symbols: ## List available symbols
+	@curl -s $(API_URL)/symbols | python3 -m json.tool 2>/dev/null || echo "API not reachable at $(API_URL)"
 
 # Internal targets
 _check-ea:
