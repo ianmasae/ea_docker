@@ -7,7 +7,7 @@ MT5_PATH_FILE="${WINEPREFIX}/.mt5-path"
 
 echo "=== MT5 Headless Container Starting ==="
 echo "Date: $(date)"
-echo "Architecture: $(uname -m) (Hangover Wine — native ARM64 + FEX emulation)"
+echo "Architecture: $(uname -m) (Wine — native x86_64)"
 echo "Wine: $(wine --version 2>/dev/null || echo 'not found')"
 
 # Start Xvfb (virtual framebuffer) with 24-bit color
@@ -214,7 +214,7 @@ fi
 # --- Start API server (if enabled) ---
 API_PID=""
 if [ "${API_ENABLED:-true}" = "true" ]; then
-    API_PORT="${API_PORT:-8000}"
+    API_PORT="${API_PORT:-${PORT:-8000}}"
     BRIDGE_PORT="${BRIDGE_PORT:-15555}"
     echo "Starting Trading API server on port ${API_PORT} (bridge: ${BRIDGE_PORT})..."
     PYTHONPATH=/ python3 -m uvicorn server.api:app --host 0.0.0.0 --port "${API_PORT}" --log-level info &

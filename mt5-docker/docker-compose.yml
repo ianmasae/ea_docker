@@ -1,8 +1,7 @@
 services:
   mt5:
     build: .
-    # No platform override — runs natively on ARM64 (Apple Silicon)
-    # Hangover Wine runs natively on ARM64, FEX emulates x86_64 app code
+    # x86_64 build for Railway/VPS deployment using WineHQ Wine
     container_name: mt5-headless
     restart: unless-stopped
     env_file:

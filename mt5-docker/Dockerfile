@@ -1,6 +1,6 @@
 # =============================================================================
-# MT5 Headless on ARM64 (Apple Silicon) using Hangover Wine
-# Hangover runs Wine natively on ARM64, emulating only Windows app code via FEX
+# MT5 Headless on x86_64 (Railway/VPS) using WineHQ Wine
+# Standard Wine runs MT5 natively on x86_64 — no emulation needed
 # =============================================================================
 FROM ubuntu:22.04
 
@@ -26,16 +26,14 @@ RUN apt-get update && \
     x11vnc novnc python3 python3-pip python3-websockify \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Hangover Wine (ARM64-native Wine with FEX x86_64 emulation)
-# This avoids raw box64 emulation issues — Wine runs natively, only app code is emulated
-RUN mkdir -p /tmp/hangover && cd /tmp/hangover && \
-    wget -q "https://github.com/AndreRH/hangover/releases/download/hangover-11.0/hangover_11.0_ubuntu2204_jammy_arm64.tar" \
-        -O hangover.tar && \
-    tar xf hangover.tar && \
+# Install WineHQ stable (x86_64 native — no emulation needed)
+RUN dpkg --add-architecture i386 && \
+    mkdir -pm755 /etc/apt/keyrings && \
+    wget -O /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key && \
+    wget -NP /etc/apt/sources.list.d/ https://dl.winehq.org/wine-builds/ubuntu/dists/jammy/winehq-jammy.sources && \
     apt-get update && \
-    apt-get install -y -f ./hangover*.deb && \
-    rm -rf /tmp/hangover /var/lib/apt/lists/* && \
-    echo "Hangover Wine installed: $(wine --version)"
+    apt-get install -y --install-recommends winehq-stable && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install Python API server dependencies
 COPY server/requirements.txt /server/requirements.txt
@@ -53,6 +51,7 @@ COPY ea/BridgeService.mq5 /opt/mt5/BridgeService.mq5
 RUN chmod +x /entrypoint.sh /healthcheck.sh /scripts/backtest.sh /scripts/parse_report.py /scripts/start_bridge_service.sh
 
 EXPOSE 8000
+EXPOSE 6080
 
 WORKDIR /opt/mt5
 
