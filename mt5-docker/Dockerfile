@@ -26,13 +26,13 @@ RUN apt-get update && \
     x11vnc novnc python3 python3-pip python3-websockify \
     && rm -rf /var/lib/apt/lists/*
 
-# Install WineHQ stable (x86_64 native — no emulation needed)
+# Install WineHQ staging (includes patches to hide debug infrastructure from anti-tamper checks)
 RUN dpkg --add-architecture i386 && \
     mkdir -pm755 /etc/apt/keyrings && \
     wget -O /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key && \
     wget -NP /etc/apt/sources.list.d/ https://dl.winehq.org/wine-builds/ubuntu/dists/jammy/winehq-jammy.sources && \
     apt-get update && \
-    apt-get install -y --install-recommends winehq-stable && \
+    apt-get install -y --install-recommends winehq-staging && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Python API server dependencies
