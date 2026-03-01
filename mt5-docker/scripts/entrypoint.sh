@@ -97,9 +97,9 @@ if [ -z "$MT5_DIR" ]; then
     wine /tmp/mt5setup.exe /auto &
     SETUP_PID=$!
 
-    # Wait for installer to finish (up to 5 minutes)
+    # Wait for installer to finish (up to 10 minutes)
     WAIT=0
-    while kill -0 $SETUP_PID 2>/dev/null && [ $WAIT -lt 300 ]; do
+    while kill -0 $SETUP_PID 2>/dev/null && [ $WAIT -lt 600 ]; do
         sleep 10
         WAIT=$((WAIT + 10))
         echo "  Installer running... (${WAIT}s)"
